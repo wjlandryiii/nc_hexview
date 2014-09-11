@@ -5,53 +5,98 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
 #include <ncurses.h>
 #include <inttypes.h>
 
+#define NBYTES_PER_LINE 16
+
 struct file_contents {
-	size_t start;
-	size_t end;
+	int fd;
+	size_t size;
 	uint8_t *bytes;
 };
 
 struct file_contents contents;
 
-int load_file(void){
-	FILE *f;
-	size_t size;
+int load_file(char *filename);
+void unload_file(void);
+void draw_window(void);
+int chloop(void);
 
-	if((f = fopen("tests/shellcode.bin", "rb")) == NULL){
-		printf("couldn't open file\n");
+int main(int argc, char *argv[]){
+	WINDOW *w;
+	
+	if(load_file("/bin/cat")){
+		return -1;
+	} else if((w = initscr()) == NULL){
+		printf("err on initscr()\n");
 		exit(-1);
-	}
-	if(fseek(f, 0, SEEK_END)){
-		printf("couldn't fseek()\n");
-		exit(-1);
-	}
-	size = ftell(f);
-	if(fseek(f, 0, SEEK_SET)){
-		printf("Couldn't fseek()\n");
-		exit(-1);
-	}
-	if(ftell(f) != 0){
-		printf("diddn't seek to begining of file\n");
-		exit(-1);
+	} else {
+		keypad(stdscr, TRUE);
+		noecho();
+		refresh();
+		curs_set(0);
+
+		draw_window();
+
+		chloop();	
+		if(endwin() == ERR){
+			printf("err on endwin()\n");
+			exit(-1);
+		}
+		unload_file();
+		return 0;
 	}
 
-	contents.start = 0;
-	contents.end = size;
-	if((contents.bytes = malloc(size)) == NULL){
-		printf("couldn't malloc()\n");
-		exit(-1);
-	}
-	if(fread(contents.bytes, size, 1, f) != 1){
-		printf("couldn't fread()\n");
-		exit(-1);
-	}
-	fclose(f);
-	return 0;
+fail_file:
+	unload_file();
+fail:
+	return -1;
 }
 
+
+int load_file(char *filename){
+	int fd;
+	off_t size;
+	void *p;
+
+	if((fd = open(filename, O_RDONLY)) == -1){
+		printf("Couldn't open file: %s\n", filename);
+		goto fail;
+	} else if((size = lseek(fd, 0, SEEK_END)) == -1){
+		printf("Couldn't seek to end of file\n");
+		goto fail_file;
+	} else if(lseek(fd, 0, SEEK_SET) == -1){
+		printf("Couldn't seek to begining of file\n");
+		goto fail_file;
+	} else {
+		p = mmap(NULL, size, PROT_READ, MAP_FILE|MAP_PRIVATE, fd, 0);
+		if(p == MAP_FAILED){
+			printf("Couldn't map file to memory\n");
+			goto fail_file;
+		} else {
+			contents.fd = fd;
+			contents.size = size;
+			contents.bytes = p;
+			return 0;
+		}
+	}
+
+fail_file:
+	close(fd);
+fail:
+	return -1;
+}
+
+void unload_file(void){
+	munmap(contents.bytes, contents.size);
+	contents.bytes = NULL;
+	close(contents.fd);
+	contents.fd = -1;
+}
 
 int cur_i = 0;
 int file_offset = 0;
@@ -64,9 +109,9 @@ void draw_line(int row, size_t foffset){
 	move(row, 0);
 	printw("%08X", foffset);
 
-	end = contents.end - foffset;
-	if(end > 16){
-		end = 16;
+	end = contents.size - foffset;
+	if(end > NBYTES_PER_LINE){
+		end = NBYTES_PER_LINE;
 	}
 
 	for(i = 0; i < end; i++){
@@ -83,6 +128,7 @@ void draw_line(int row, size_t foffset){
 	}
 }
 
+
 void draw_window(void){
 	int row;
 	int foffset;
@@ -95,23 +141,23 @@ void draw_window(void){
 	nrows = getmaxy(stdscr);
 	ncolumns = getmaxx(stdscr);
 
-	first_row = file_offset / 16;
-	c_row = cur_i / 16;
+	first_row = file_offset / NBYTES_PER_LINE;
+	c_row = cur_i / NBYTES_PER_LINE;
 	last_row = first_row + nrows;
 
 	if(c_row < first_row){
 		first_row = c_row;
-		file_offset = first_row * 16;
+		file_offset = first_row * NBYTES_PER_LINE;
 		last_row = first_row + nrows;
 	} else if(c_row > last_row - 1){
 		last_row = c_row;
 		first_row = last_row - nrows + 1;
-		file_offset = first_row * 16;
+		file_offset = first_row * NBYTES_PER_LINE;
 	}
 
 	clear();
 	for(row = 0; row < nrows; row++){
-		foffset = file_offset + row * 16;
+		foffset = file_offset + row * NBYTES_PER_LINE;
 		draw_line(row, foffset);
 	}
 	refresh();
@@ -119,29 +165,31 @@ void draw_window(void){
 
 
 void move_cursor_up(){
-	if(cur_i / 16 == 0){
+	if(cur_i / NBYTES_PER_LINE == 0){
 		beep();
 	} else {
-		cur_i -= 16;
+		cur_i -= NBYTES_PER_LINE;
 		draw_window();
 	}
 }
 
+
 void move_cursor_down(){
-	if(cur_i / 16 == contents.end / 16){
+	if(cur_i / NBYTES_PER_LINE == contents.size / NBYTES_PER_LINE){
 		beep();
 	} else {
-		if(cur_i + 16 >= contents.end){
-			cur_i = contents.end - 1;
+		if(cur_i + NBYTES_PER_LINE >= contents.size){
+			cur_i = contents.size - 1;
 		} else {
-			cur_i += 16;
+			cur_i += NBYTES_PER_LINE;
 		}
 		draw_window();
 	}
 }
 
+
 void move_cursor_left(){
-	if(cur_i % 16 == 0){
+	if(cur_i % NBYTES_PER_LINE == 0){
 		beep();
 	} else {
 		cur_i -= 1;
@@ -149,10 +197,11 @@ void move_cursor_left(){
 	}
 }
 
+
 void move_cursor_right(){
-	if(cur_i == contents.end - 1){
+	if(cur_i == contents.size - 1){
 		beep();
-	} else if(cur_i % 16 == 15){
+	} else if(cur_i % NBYTES_PER_LINE == NBYTES_PER_LINE - 1){
 		beep();
 	} else {
 		cur_i += 1;
@@ -160,57 +209,37 @@ void move_cursor_right(){
 	}
 }
 
+
 void scroll_up(void){
-	if(cur_i / 16 == 0){
+	if(cur_i / NBYTES_PER_LINE == 0){
 		beep();
 	} else {
-		if(cur_i - 16 * 16 < 0){
-			cur_i = cur_i % 16;
+		if(cur_i - NBYTES_PER_LINE * 16 < 0){
+			cur_i = cur_i % NBYTES_PER_LINE;
 		} else {
-			cur_i -= 16 * 16;
+			cur_i -= NBYTES_PER_LINE * 16;
 		}
 		draw_window();
 	}
 }
+
 
 void scroll_down(void){
-	if(cur_i / 16 == (contents.end - 1)/16){
+	int cur_row = cur_i / NBYTES_PER_LINE;
+	int last_row = (contents.size - 1) / NBYTES_PER_LINE;
+
+	if(cur_row == last_row){
 		beep();
 	} else {
-		if(cur_i / 16 + 16 > (contents.end - 1) / 16){
-			cur_i = contents.end - 1;
+		if(cur_row + 16 > last_row){
+			cur_i = contents.size - 1;
 		} else {
-			cur_i += 16 * 16;
+			cur_i += NBYTES_PER_LINE * 16;
 		}
 		draw_window();
 	}
 }
 
-
-int chloop(void);
-int main(int argc, char *argv[]){
-	WINDOW *w;
-	
-	load_file();
-
-	if((w = initscr()) == NULL){
-		printf("err on initscr()\n");
-		exit(-1);
-	}
-	keypad(stdscr, TRUE);
-	noecho();
-	refresh();
-	curs_set(0);
-
-	draw_window();
-
-	chloop();	
-	if(endwin() == ERR){
-		printf("err on endwin()\n");
-		exit(-1);
-	}
-	return 0;
-}
 
 int chloop(void){
 	int ch = 0;
